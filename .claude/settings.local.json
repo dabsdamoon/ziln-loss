@@ -7,7 +7,9 @@
       "Bash(pip install:*)",
       "Bash(python:*)",
       "Bash(conda run -n zil-loss python:*)",
-      "Bash(conda run -n ziln-loss python:*)"
+      "Bash(conda run -n ziln-loss python:*)",
+      "Read(//mnt/d/datasets/acquire-valued-shoppers-challenge/**)",
+      "Bash(conda run:*)"
     ],
     "deny": [],
     "ask": []
