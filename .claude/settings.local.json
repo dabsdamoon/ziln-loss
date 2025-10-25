@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda create:*)",
+      "Bash(source:*)",
+      "Bash(conda activate:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(conda run -n zil-loss python:*)",
+      "Bash(conda run -n ziln-loss python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
