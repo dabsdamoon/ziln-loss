@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
@@ -33,7 +33,7 @@ from typing import Optional, Dict, List
 import json
 from datetime import datetime
 
-from model import ZILNModel, SimpleMLPModel
+from model import ZILNModel, SimpleMLPModel, XGBoostLTVModel
 from loss import get_loss_function, ZILNLoss, MSELossForZILN, SimpleMSELoss
 from evaluation import compute_all_metrics, compute_metrics_from_model
 
@@ -412,14 +412,14 @@ class LTVTrainer:
 
 def prepare_features(df: pd.DataFrame, scalers: dict = None, is_train: bool = True):
     """
-    Prepare features for training.
+    Prepare features for training with one-hot encoding and min-max normalization.
 
     Parameters
     ----------
     df : pd.DataFrame
         Input dataframe
     scalers : dict, optional
-        Dictionary of fitted scalers (for test set)
+        Dictionary of fitted scalers/encoders (for test set)
     is_train : bool
         Whether this is training data
 
@@ -432,49 +432,79 @@ def prepare_features(df: pd.DataFrame, scalers: dict = None, is_train: bool = Tr
 
     # Separate features and target
     target_col = 'future_12m_purchase_value'
-    feature_cols = [
-        'initial_purchase_amount',
-        'initial_num_items',
-        'chain',
-        'initial_category',
-        'initial_brand'
-    ]
 
-    # Handle categorical features (label encoding for simplicity)
-    categorical_cols = ['chain', 'initial_category', 'initial_brand', 'initial_productmeasure']
+    # Define categorical and numerical columns
+    categorical_cols = ['chain', 'initial_category', 'initial_brand']
     numerical_cols = ['initial_purchase_amount', 'initial_num_items']
-
-    # Label encoding for categorical features
-    if is_train:
-        scalers = {}
-        for col in categorical_cols:
-            if col in df.columns:
-                le = LabelEncoder()
-                df[col] = le.fit_transform(df[col].astype(str))
-                scalers[f'le_{col}'] = le
-
-        # Standard scaling for numerical features
-        scaler = StandardScaler()
-        df[numerical_cols] = scaler.fit_transform(df[numerical_cols])
-        scalers['standard_scaler'] = scaler
-    else:
-        for col in categorical_cols:
-            if col in df.columns and f'le_{col}' in scalers:
-                le = scalers[f'le_{col}']
-                # Handle unseen categories
-                df[col] = df[col].astype(str).map(
-                    lambda x: le.transform([x])[0] if x in le.classes_ else -1
-                )
-        df[numerical_cols] = scalers['standard_scaler'].transform(df[numerical_cols])
-
-    # Extract features that are available
-    available_features = [col for col in feature_cols if col in df.columns]
 
     # Handle productmeasure if present
     if 'initial_productmeasure' in df.columns:
-        available_features.append('initial_productmeasure')
+        categorical_cols.append('initial_productmeasure')
 
-    X = df[available_features].values.astype(np.float32)
+    # Filter to only available columns
+    categorical_cols = [col for col in categorical_cols if col in df.columns]
+    numerical_cols = [col for col in numerical_cols if col in df.columns]
+
+    if is_train:
+        scalers = {}
+
+        # One-hot encoding for categorical features
+        if len(categorical_cols) > 0:
+            # Convert to string and handle missing values
+            for col in categorical_cols:
+                df[col] = df[col].astype(str).fillna('missing')
+
+            # Fit one-hot encoder
+            onehot_encoder = OneHotEncoder(
+                sparse_output=False,
+                handle_unknown='ignore',  # Handle unseen categories in test set
+                dtype=np.float32
+            )
+            categorical_encoded = onehot_encoder.fit_transform(df[categorical_cols])
+            scalers['onehot_encoder'] = onehot_encoder
+
+            # Get feature names for debugging
+            try:
+                feature_names = onehot_encoder.get_feature_names_out(categorical_cols)
+                scalers['onehot_feature_names'] = feature_names
+            except:
+                pass
+        else:
+            categorical_encoded = np.array([]).reshape(len(df), 0)
+
+        # Min-max scaling for numerical features
+        if len(numerical_cols) > 0:
+            minmax_scaler = MinMaxScaler()
+            numerical_scaled = minmax_scaler.fit_transform(df[numerical_cols])
+            scalers['minmax_scaler'] = minmax_scaler
+        else:
+            numerical_scaled = np.array([]).reshape(len(df), 0)
+
+        # Combine features
+        X = np.hstack([numerical_scaled, categorical_encoded]).astype(np.float32)
+
+    else:
+        # Transform using fitted scalers/encoders
+
+        # One-hot encoding for categorical features
+        if len(categorical_cols) > 0 and 'onehot_encoder' in scalers:
+            # Convert to string and handle missing values
+            for col in categorical_cols:
+                df[col] = df[col].astype(str).fillna('missing')
+
+            categorical_encoded = scalers['onehot_encoder'].transform(df[categorical_cols])
+        else:
+            categorical_encoded = np.array([]).reshape(len(df), 0)
+
+        # Min-max scaling for numerical features
+        if len(numerical_cols) > 0 and 'minmax_scaler' in scalers:
+            numerical_scaled = scalers['minmax_scaler'].transform(df[numerical_cols])
+        else:
+            numerical_scaled = np.array([]).reshape(len(df), 0)
+
+        # Combine features
+        X = np.hstack([numerical_scaled, categorical_encoded]).astype(np.float32)
+
     y = df[target_col].values.astype(np.float32)
 
     return X, y, scalers
@@ -602,6 +632,266 @@ def plot_results(train_losses, val_losses, output_dir, loss_name):
     plt.close()
 
 
+def train_xgboost_model(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    args,
+    run_path: Path
+):
+    """
+    Train XGBoost model for comparison with eval_history tracking.
+
+    Parameters
+    ----------
+    X_train, y_train : np.ndarray
+        Training data
+    X_val, y_val : np.ndarray
+        Validation data
+    X_test, y_test : np.ndarray
+        Test data
+    args : argparse.Namespace
+        Training arguments
+    run_path : Path
+        Directory to save results
+
+    Returns
+    -------
+    XGBoostLTVModel, dict, np.ndarray, np.ndarray
+        Trained model, metrics, predictions, true values
+    """
+    print("\n" + "=" * 60)
+    print("Training XGBoost Model")
+    print("=" * 60)
+
+    # Create XGBoost model
+    model = XGBoostLTVModel(
+        objective='reg:squarederror',
+        max_depth=args.xgb_max_depth,
+        learning_rate=args.learning_rate,
+        n_estimators=args.xgb_n_estimators,
+        subsample=args.xgb_subsample,
+        colsample_bytree=args.xgb_colsample_bytree,
+        min_child_weight=args.xgb_min_child_weight,
+        gamma=args.xgb_gamma,
+        reg_alpha=args.xgb_reg_alpha,
+        reg_lambda=args.xgb_reg_lambda,
+        random_state=42
+    )
+
+    print(f"Model: {model}")
+
+    # Train model with periodic evaluation
+    print("\nTraining with periodic evaluation...")
+    eval_interval = args.eval_interval if hasattr(args, 'eval_interval') else 10
+    n_estimators = args.xgb_n_estimators
+
+    # Initialize eval history
+    eval_history = []
+
+    # Train incrementally to track metrics at intervals
+    import xgboost as xgb
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dval = xgb.DMatrix(X_val, label=y_val)
+
+    params = {
+        'objective': 'reg:squarederror',
+        'max_depth': args.xgb_max_depth,
+        'learning_rate': args.learning_rate,
+        'subsample': args.xgb_subsample,
+        'colsample_bytree': args.xgb_colsample_bytree,
+        'min_child_weight': args.xgb_min_child_weight,
+        'gamma': args.xgb_gamma,
+        'reg_alpha': args.xgb_reg_alpha,
+        'reg_lambda': args.xgb_reg_lambda,
+        'random_state': 42,
+        'n_jobs': -1
+    }
+
+    evals_result = {}
+    xgb_model = None
+    best_iteration = 0
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    for current_round in range(0, n_estimators, eval_interval):
+        rounds_to_train = min(eval_interval, n_estimators - current_round)
+
+        # Train for eval_interval rounds
+        xgb_model = xgb.train(
+            params=params,
+            dtrain=dtrain,
+            num_boost_round=rounds_to_train,
+            evals=[(dtrain, 'train'), (dval, 'val')],
+            xgb_model=xgb_model,  # Continue from previous model
+            evals_result=evals_result,
+            verbose_eval=False
+        )
+
+        iteration = current_round + rounds_to_train
+
+        # Get train and val loss
+        train_loss = evals_result['train']['rmse'][-1]
+        val_loss = evals_result['val']['rmse'][-1]
+
+        # Compute comprehensive metrics on validation set
+        val_preds = xgb_model.predict(dval)
+        val_preds = np.maximum(val_preds, 0)  # Ensure non-negative
+        val_metrics = compute_all_metrics(y_val, val_preds)
+
+        # Save to eval history
+        eval_result = {
+            'iteration': iteration,
+            'train_loss': train_loss,
+            'val_loss': val_loss,
+            **{f'val_{k}': v for k, v in val_metrics.items()}
+        }
+        eval_history.append(eval_result)
+
+        # Print progress
+        if iteration % (eval_interval * 2) == 0 or iteration == n_estimators:
+            print(f"\n--- Iteration {iteration}/{n_estimators} - Comprehensive Evaluation ---")
+            print(f"  Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            print(f"  Normalized Gini: {val_metrics['normalized_gini']:.4f} (PRIMARY)")
+            print(f"  Spearman Corr: {val_metrics['spearman']:.4f}")
+            print(f"  Decile MAPE: {val_metrics['decile_mape']:.1f}%")
+            print(f"  MAE: {val_metrics['mae']:.2f}, RMSE: {val_metrics['rmse']:.2f}")
+            print(f"  AUC-PR: {val_metrics['auc_pr']:.4f}")
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_iteration = iteration
+            patience_counter = 0
+        else:
+            patience_counter += eval_interval
+
+        if patience_counter >= args.early_stopping_patience:
+            print(f"\nEarly stopping at iteration {iteration}")
+            break
+
+    # Store the trained model in our wrapper
+    model.model = xgb_model
+    model.is_fitted = True
+    model.evals_result = evals_result
+
+    # Save eval_history.csv (same format as PyTorch models)
+    eval_df = pd.DataFrame(eval_history)
+    eval_history_path = run_path / 'eval_history.csv'
+    eval_df.to_csv(eval_history_path, index=False)
+    print(f"\nEvaluation history saved to: {eval_history_path}")
+
+    print(f"Best iteration: {best_iteration} (val_loss: {best_val_loss:.4f})")
+
+    # Plot training curves (XGBoost style)
+    if hasattr(model, 'evals_result') and model.evals_result:
+        plt.figure(figsize=(10, 6))
+
+        # Get loss metric name (first metric in results)
+        metric_name = list(model.evals_result['train'].keys())[0]
+
+        train_losses = model.evals_result['train'][metric_name]
+        val_losses = model.evals_result['val'][metric_name] if 'val' in model.evals_result else None
+
+        plt.plot(train_losses, label='Train Loss')
+        if val_losses:
+            plt.plot(val_losses, label='Val Loss')
+
+        plt.xlabel('Boosting Round')
+        plt.ylabel('Loss')
+        plt.title('XGBoost Training and Validation Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(run_path / 'training_curves_xgboost.png', dpi=300, bbox_inches='tight')
+        plt.close()
+
+    # Evaluate on test set
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION ON TEST SET")
+    print("=" * 60)
+
+    test_preds = model.predict(X_test)
+    metrics = compute_all_metrics(y_test, test_preds)
+
+    print("\nTest Set Metrics (from paper):")
+    print("-" * 60)
+    print(f"  Normalized Gini: {metrics['normalized_gini']:.4f} (PRIMARY METRIC)")
+    print(f"  Spearman Correlation: {metrics['spearman']:.4f}")
+    print(f"  Decile MAPE: {metrics['decile_mape']:.1f}%")
+    print(f"  MAE: {metrics['mae']:.2f}")
+    print(f"  RMSE: {metrics['rmse']:.2f}")
+    print(f"  AUC-PR: {metrics['auc_pr']:.4f}")
+    print("-" * 60)
+
+    # Save model
+    model_path = run_path / 'model_best.pkl'
+    model.save_model(str(model_path))
+    print(f"\nModel saved to: {model_path}")
+
+    # Save predictions
+    results_df = pd.DataFrame({
+        'true_ltv': y_test,
+        'predicted_ltv': test_preds
+    })
+    predictions_path = run_path / 'test_predictions.csv'
+    results_df.to_csv(predictions_path, index=False)
+    print(f"Predictions saved to: {predictions_path}")
+
+    # Save feature importance
+    try:
+        importance = model.get_feature_importance(importance_type='gain')
+        importance_df = pd.DataFrame([
+            {'feature': k, 'importance': v}
+            for k, v in importance.items()
+        ]).sort_values('importance', ascending=False)
+
+        importance_path = run_path / 'feature_importance.csv'
+        importance_df.to_csv(importance_path, index=False)
+        print(f"Feature importance saved to: {importance_path}")
+
+        # Plot feature importance
+        plt.figure(figsize=(10, 6))
+        importance_df_top = importance_df.head(20)
+        plt.barh(range(len(importance_df_top)), importance_df_top['importance'])
+        plt.yticks(range(len(importance_df_top)), importance_df_top['feature'])
+        plt.xlabel('Importance (Gain)')
+        plt.title('Top 20 Feature Importance')
+        plt.tight_layout()
+        plt.savefig(run_path / 'feature_importance.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    except Exception as e:
+        print(f"Could not save feature importance: {e}")
+
+    # Save training configuration
+    config_path = run_path / 'config.json'
+    metrics_serializable = {k: float(v) for k, v in metrics.items()}
+
+    config = {
+        'model_type': 'xgboost',
+        'max_depth': args.xgb_max_depth,
+        'learning_rate': args.learning_rate,
+        'n_estimators': args.xgb_n_estimators,
+        'subsample': args.xgb_subsample,
+        'colsample_bytree': args.xgb_colsample_bytree,
+        'min_child_weight': args.xgb_min_child_weight,
+        'gamma': args.xgb_gamma,
+        'reg_alpha': args.xgb_reg_alpha,
+        'reg_lambda': args.xgb_reg_lambda,
+        'input_dim': int(X_train.shape[1]),
+        'train_samples': int(len(X_train)),
+        'test_samples': int(len(X_test)),
+        'final_metrics': metrics_serializable
+    }
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to: {config_path}")
+
+    return model, metrics, test_preds, y_test
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Train LTV prediction model with flexible loss functions'
@@ -630,8 +920,8 @@ def main():
         '--model_type',
         type=str,
         default='auto',
-        choices=['auto', 'ziln', 'simple'],
-        help='Model type (auto, ziln, or simple). Auto chooses based on loss.'
+        choices=['auto', 'ziln', 'simple', 'xgboost'],
+        help='Model type (auto, ziln, simple, or xgboost). Auto chooses based on loss.'
     )
     parser.add_argument(
         '--hidden_dims',
@@ -689,12 +979,63 @@ def main():
         help='Interval (in epochs) for comprehensive evaluation (default: 5)'
     )
 
+    # XGBoost-specific arguments
+    parser.add_argument(
+        '--xgb_max_depth',
+        type=int,
+        default=6,
+        help='XGBoost max tree depth (default: 6)'
+    )
+    parser.add_argument(
+        '--xgb_n_estimators',
+        type=int,
+        default=100,
+        help='XGBoost number of boosting rounds (default: 100)'
+    )
+    parser.add_argument(
+        '--xgb_subsample',
+        type=float,
+        default=0.8,
+        help='XGBoost subsample ratio (default: 0.8)'
+    )
+    parser.add_argument(
+        '--xgb_colsample_bytree',
+        type=float,
+        default=0.8,
+        help='XGBoost column subsample ratio (default: 0.8)'
+    )
+    parser.add_argument(
+        '--xgb_min_child_weight',
+        type=int,
+        default=1,
+        help='XGBoost min child weight (default: 1)'
+    )
+    parser.add_argument(
+        '--xgb_gamma',
+        type=float,
+        default=0.0,
+        help='XGBoost gamma (min split loss) (default: 0.0)'
+    )
+    parser.add_argument(
+        '--xgb_reg_alpha',
+        type=float,
+        default=0.0,
+        help='XGBoost L1 regularization (default: 0.0)'
+    )
+    parser.add_argument(
+        '--xgb_reg_lambda',
+        type=float,
+        default=1.0,
+        help='XGBoost L2 regularization (default: 1.0)'
+    )
+
     args = parser.parse_args()
 
     # Create TensorBoard log directory (this will be our main experiment directory)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     if args.log_dir is None:
-        log_dir = f'runs/{args.loss_name}_{timestamp}'
+        model_name = args.model_type if args.model_type != 'auto' else args.loss_name
+        log_dir = f'runs/{model_name}_{timestamp}'
     else:
         log_dir = args.log_dir
 
@@ -702,8 +1043,9 @@ def main():
     run_path = Path(log_dir)
     run_path.mkdir(parents=True, exist_ok=True)
 
+    model_display = args.model_type.upper() if args.model_type != 'auto' else args.loss_name.upper()
     print("=" * 60)
-    print(f"LTV Prediction Model Training - {args.loss_name.upper()} Loss")
+    print(f"LTV Prediction Model Training - {model_display}")
     print("=" * 60)
     print(f"Experiment directory: {log_dir}")
     print(f"  - TensorBoard logs: {log_dir}/")
@@ -720,22 +1062,83 @@ def main():
 
     # Prepare features
     print("\nPreparing features...")
+    print("  - Numerical features: Min-Max normalization [0, 1]")
+    print("  - Categorical features: One-hot encoding")
     X_train, y_train, scalers = prepare_features(train_df, is_train=True)
     X_test, y_test, _ = prepare_features(test_df, scalers=scalers, is_train=False)
 
-    print(f"Feature dimension: {X_train.shape[1]}")
+    # Print feature engineering details
+    print(f"\nFeature Engineering Summary:")
+    print(f"  Total features: {X_train.shape[1]}")
 
-    # Create dataloaders
-    print("\nCreating dataloaders...")
-    train_loader, val_loader, test_loader = create_dataloaders(
-        X_train, y_train, X_test, y_test, batch_size=args.batch_size
-    )
+    # Count numerical vs categorical features
+    if 'minmax_scaler' in scalers:
+        n_numerical = scalers['minmax_scaler'].n_features_in_
+        print(f"  - Numerical (min-max scaled): {n_numerical}")
+    else:
+        n_numerical = 0
+
+    if 'onehot_encoder' in scalers:
+        n_categorical_original = scalers['onehot_encoder'].n_features_in_
+        n_categorical_encoded = len(scalers['onehot_encoder'].get_feature_names_out())
+        print(f"  - Categorical (original): {n_categorical_original}")
+        print(f"  - Categorical (one-hot encoded): {n_categorical_encoded}")
+    else:
+        n_categorical_encoded = 0
+
+    print(f"  Formula: {n_numerical} + {n_categorical_encoded} = {X_train.shape[1]}")
 
     # Auto-select model type based on loss
     if args.model_type == 'auto':
         model_type = 'ziln' if args.loss_name in ['ziln', 'mse'] else 'simple'
     else:
         model_type = args.model_type
+
+    # Handle XGBoost training separately (doesn't use PyTorch dataloaders)
+    if model_type == 'xgboost':
+        # Split train into train and validation
+        n_val = int(len(X_train) * 0.2)
+        indices = np.random.permutation(len(X_train))
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        X_train_split = X_train[train_indices]
+        y_train_split = y_train[train_indices]
+        X_val = X_train[val_indices]
+        y_val = y_train[val_indices]
+
+        # Train XGBoost model
+        model, metrics, preds, true = train_xgboost_model(
+            X_train=X_train_split,
+            y_train=y_train_split,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            args=args,
+            run_path=run_path
+        )
+
+        print("\n" + "=" * 60)
+        print("Training Complete!")
+        print("=" * 60)
+        print(f"\nExperiment saved to: {run_path}")
+        print(f"\nContents:")
+        print(f"  - Model checkpoint: model_best.pkl")
+        print(f"  - Predictions: test_predictions.csv")
+        print(f"  - Evaluation history: eval_history.csv")
+        print(f"  - Training curves: training_curves_xgboost.png")
+        print(f"  - Feature importance: feature_importance.csv, feature_importance.png")
+        print(f"  - Configuration: config.json")
+        print("=" * 60)
+
+        return
+
+    # Create dataloaders for PyTorch models
+    print("\nCreating dataloaders...")
+    train_loader, val_loader, test_loader = create_dataloaders(
+        X_train, y_train, X_test, y_test, batch_size=args.batch_size
+    )
 
     # Create model
     print(f"\nInitializing {model_type.upper()} model...")

@@ -27,12 +27,27 @@ This project implements a deep neural network with ZILN loss to predict customer
    - Three output heads: p (return probability), μ (mean), σ (std)
    - Numerical stability bounds to prevent overflow
 
-2. **Loss Functions** (`loss/loss.py`)
+2. **SimpleMLPModel** (`model/model.py`)
+   - Simple MLP for direct LTV prediction
+   - Used as baseline for comparison
+
+3. **XGBoostLTVModel** (`model/xgboost_model.py`)
+   - Gradient boosting baseline for comparison
+   - Feature importance analysis
+   - Standard tree-based regression (predicts mean only)
+
+4. **XGBoostQuantileModel** (`model/xgboost_model.py`)
+   - XGBoost with quantile regression
+   - Predicts full distribution via multiple quantiles
+   - Captures uncertainty with prediction intervals
+   - Alternative to ZILN for uncertainty estimation
+
+5. **Loss Functions** (`loss/loss.py`)
    - `ZILNLoss`: Zero-Inflated Lognormal loss (main)
    - `MSELossForZILN`: MSE baseline for comparison
    - Additional robust losses: Huber, Quantile, LogCosh
 
-3. **Evaluation Metrics** (`evaluation/metrics.py`)
+6. **Evaluation Metrics** (`evaluation/metrics.py`)
    - Normalized Gini Coefficient (PRIMARY)
    - Spearman's Rank Correlation
    - Decile-level MAPE
@@ -102,6 +117,11 @@ python preprocessor/preprocess.py \
 - Splits into train/test (80/20) by company
 - Saves to `data/processed/train.parquet` and `test.parquet`
 
+**Feature Engineering:**
+- **Numerical features** (initial_purchase_amount, initial_num_items): Min-Max normalization [0, 1]
+- **Categorical features** (chain, initial_category, initial_brand, initial_productmeasure): One-hot encoding
+- Handles unseen categories in test set gracefully
+
 **Memory optimization options:**
 ```bash
 # For limited RAM
@@ -130,6 +150,10 @@ python eda_target_distribution.py
 
 ### 3. Training
 
+The training script automatically applies proper feature engineering:
+- **Numerical features**: Min-Max normalization to [0, 1]
+- **Categorical features**: One-hot encoding with unknown category handling
+
 #### Basic Training
 
 ```bash
@@ -147,6 +171,20 @@ python train_ziln_model.py \
 - `test_predictions.csv` - Final predictions
 - `config.json` - Training configuration
 
+**Training output example:**
+```
+Preparing features...
+  - Numerical features: Min-Max normalization [0, 1]
+  - Categorical features: One-hot encoding
+
+Feature Engineering Summary:
+  Total features: 125
+  - Numerical (min-max scaled): 2
+  - Categorical (original): 3
+  - Categorical (one-hot encoded): 123
+  Formula: 2 + 123 = 125
+```
+
 #### Training Options
 
 ```bash
@@ -162,10 +200,101 @@ python train_ziln_model.py \
     --log_dir runs/my_experiment    # Custom output directory
 ```
 
-#### Compare ZILN vs MSE
+#### Train XGBoost for Comparison
+
+You can now train an XGBoost model as a baseline for comparison:
 
 ```bash
-# Automated comparison (trains both models)
+# Train XGBoost model
+python train_ziln_model.py \
+    --model_type xgboost \
+    --learning_rate 0.1 \
+    --xgb_n_estimators 100 \
+    --xgb_max_depth 6
+```
+
+**XGBoost-specific options:**
+```bash
+python train_ziln_model.py \
+    --model_type xgboost \
+    --learning_rate 0.1 \           # Boosting learning rate
+    --xgb_n_estimators 100 \        # Number of trees
+    --xgb_max_depth 6 \             # Max tree depth
+    --xgb_subsample 0.8 \           # Row sampling ratio
+    --xgb_colsample_bytree 0.8 \   # Column sampling ratio
+    --xgb_min_child_weight 1 \      # Minimum child weight
+    --xgb_gamma 0.0 \               # Min split loss
+    --xgb_reg_alpha 0.0 \           # L1 regularization
+    --xgb_reg_lambda 1.0            # L2 regularization
+```
+
+**Output directory:** `runs/xgboost_<timestamp>/`
+- `model_best.pkl` - Trained XGBoost model
+- `test_predictions.csv` - Final predictions
+- `eval_history.csv` - Metrics tracked over boosting rounds
+- `feature_importance.csv` & `.png` - Feature importance analysis
+- `training_curves_xgboost.png` - Training curves
+- `config.json` - Training configuration
+
+**Note:** XGBoost uses `--eval_interval` (default: 10) to evaluate comprehensive metrics every N boosting rounds, creating an `eval_history.csv` file with the same format as PyTorch models. This allows for fair comparison of training dynamics across all model types.
+
+#### XGBoost Quantile Regression (Capture Uncertainty)
+
+**Problem:** Standard XGBoost only predicts the mean, not the variation/uncertainty.
+
+**Solution:** XGBoost Quantile Regression predicts the full distribution by training multiple models for different quantiles (10th, 50th, 90th percentiles, etc.).
+
+```python
+from model import XGBoostQuantileModel
+from train_ziln_model import prepare_features
+import pandas as pd
+
+# Load and prepare data
+train_df = pd.read_parquet('data/processed/train.parquet')
+test_df = pd.read_parquet('data/processed/test.parquet')
+X_train, y_train, scalers = prepare_features(train_df, is_train=True)
+X_test, y_test, _ = prepare_features(test_df, scalers=scalers, is_train=False)
+
+# Train quantile regression (predicts 10th, 50th, 90th percentiles)
+model = XGBoostQuantileModel(
+    quantiles=[0.1, 0.5, 0.9],  # Lower bound, median, upper bound
+    n_estimators=100
+)
+model.fit(X_train, y_train)
+
+# Get predictions with uncertainty
+predictions = model.predict(X_test)
+# Returns: {
+#   'q_0.5': median predictions,
+#   'q_0.1': lower bound (10th percentile),
+#   'q_0.9': upper bound (90th percentile),
+#   'mean': average across quantiles,
+#   'width': prediction interval width
+# }
+
+# Or get 80% prediction interval
+median, lower, upper = model.get_prediction_intervals(X_test, confidence=0.8)
+```
+
+**Full example:**
+```bash
+python example_quantile_xgboost.py
+```
+
+This creates visualizations showing:
+- Prediction intervals (uncertainty bands)
+- All quantile predictions
+- Calibration analysis
+
+**Comparison with ZILN:**
+- ZILN: Predicts distribution via parameters (p, μ, σ) - single model
+- XGBoost Quantile: Predicts distribution via multiple quantiles - multiple models
+- Both capture uncertainty, but different approaches
+
+#### Compare ZILN vs MSE vs XGBoost
+
+```bash
+# Automated comparison (trains both neural models)
 ./run_comparison_experiment.sh
 ```
 
@@ -176,6 +305,9 @@ python train_ziln_model.py --loss_name ziln --epochs 50
 
 # Train MSE baseline
 python train_ziln_model.py --loss_name mse --epochs 50
+
+# Train XGBoost baseline
+python train_ziln_model.py --model_type xgboost --xgb_n_estimators 100
 
 # Compare results
 python compare_tensorboards.py --plot \
@@ -253,6 +385,25 @@ Based on the paper's evaluation methodology:
 - ZILN Normalized Gini: 0.368 vs MSE: 0.330 (+11.4%)
 - ZILN Spearman: 0.484 vs MSE: 0.327 (+48.0%)
 - ZILN Decile MAPE: 22.6% vs MSE: 72.8% (-68.9%)
+
+**Evaluation History:**
+
+All models (ZILN, MLP, XGBoost) generate an `eval_history.csv` file tracking metrics over time:
+- **PyTorch models**: Metrics computed every `--eval_interval` epochs (default: 5)
+- **XGBoost**: Metrics computed every `--eval_interval` boosting rounds (default: 10)
+
+Example `eval_history.csv`:
+```csv
+iteration,train_loss,val_loss,val_normalized_gini,val_spearman,val_decile_mape,val_mae,val_rmse,val_auc_pr
+10,0.8234,0.7891,0.3521,0.4123,28.3,12.45,18.76,0.7821
+20,0.7456,0.7234,0.3789,0.4456,25.1,11.23,17.89,0.8012
+...
+```
+
+This allows you to:
+- Track learning progress over time
+- Compare training dynamics across different models
+- Use the same comparison tools for all model types
 
 ## Memory Management
 
@@ -360,10 +511,13 @@ python train_ziln_model.py --loss_name ziln --epochs 50
 # 4. Train MSE baseline
 python train_ziln_model.py --loss_name mse --epochs 50
 
-# 5. View results
+# 5. Train XGBoost baseline
+python train_ziln_model.py --model_type xgboost --xgb_n_estimators 100
+
+# 6. View results
 tensorboard --logdir runs
 
-# 6. Compare models
+# 7. Compare models
 python compare_tensorboards.py --plot \
     --eval1 runs/ziln_<timestamp>/eval_history.csv \
     --eval2 runs/mse_<timestamp>/eval_history.csv
@@ -371,8 +525,9 @@ python compare_tensorboards.py --plot \
 
 **Expected training time:**
 - Preprocessing: 5-15 minutes (20 files)
-- Training: 10-30 minutes (50 epochs)
-- Total: ~30-45 minutes for complete comparison
+- Training (Neural): 10-30 minutes (50 epochs)
+- Training (XGBoost): 2-5 minutes (100 trees)
+- Total: ~30-50 minutes for complete comparison
 
 ## Key Results to Expect
 
