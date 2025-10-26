@@ -33,7 +33,7 @@ from typing import Optional, Dict, List
 import json
 from datetime import datetime
 
-from model import ZILNModel, SimpleMLPModel, XGBoostLTVModel
+from model import ZILNModel, SimpleMLPModel, XGBoostLTVModel, LinearRegressionModel
 from loss import get_loss_function, ZILNLoss, MSELossForZILN, SimpleMSELoss
 from evaluation import compute_all_metrics, compute_metrics_from_model
 
@@ -632,6 +632,146 @@ def plot_results(train_losses, val_losses, output_dir, loss_name):
     plt.close()
 
 
+def train_linear_model(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    args,
+    run_path: Path
+):
+    """
+    Train Linear Regression model for comparison.
+
+    Parameters
+    ----------
+    X_train, y_train : np.ndarray
+        Training data
+    X_val, y_val : np.ndarray
+        Validation data
+    X_test, y_test : np.ndarray
+        Test data
+    args : argparse.Namespace
+        Training arguments
+    run_path : Path
+        Directory to save results
+
+    Returns
+    -------
+    LinearRegressionModel, dict, np.ndarray, np.ndarray
+        Trained model, metrics, predictions, true values
+    """
+    print("\n" + "=" * 60)
+    print("Training Linear Regression Model")
+    print("=" * 60)
+
+    # Determine regularization type
+    regularization = getattr(args, 'linear_regularization', 'none')
+    alpha = getattr(args, 'linear_alpha', 1.0)
+
+    # Create Linear Regression model
+    model = LinearRegressionModel(
+        regularization=regularization,
+        alpha=alpha,
+        fit_intercept=True
+    )
+
+    print(f"Model: {model}")
+
+    # Combine train and val for final training (linear regression doesn't use val)
+    X_train_full = np.vstack([X_train, X_val])
+    y_train_full = np.hstack([y_train, y_val])
+
+    # Train model
+    print("\nTraining...")
+    model.fit(
+        X_train=X_train_full,
+        y_train=y_train_full,
+        verbose=True
+    )
+
+    # Evaluate on test set
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION ON TEST SET")
+    print("=" * 60)
+
+    test_preds = model.predict(X_test)
+    metrics = compute_all_metrics(y_test, test_preds)
+
+    print("\nTest Set Metrics (from paper):")
+    print("-" * 60)
+    print(f"  Normalized Gini: {metrics['normalized_gini']:.4f} (PRIMARY METRIC)")
+    print(f"  Spearman Correlation: {metrics['spearman']:.4f}")
+    print(f"  Decile MAPE: {metrics['decile_mape']:.1f}%")
+    print(f"  MAE: {metrics['mae']:.2f}")
+    print(f"  RMSE: {metrics['rmse']:.2f}")
+    print(f"  AUC-PR: {metrics['auc_pr']:.4f}")
+    print("-" * 60)
+
+    # Save model
+    model_path = run_path / 'model_best.pkl'
+    model.save_model(str(model_path))
+    print(f"\nModel saved to: {model_path}")
+
+    # Save predictions
+    results_df = pd.DataFrame({
+        'true_ltv': y_test,
+        'predicted_ltv': test_preds
+    })
+    predictions_path = run_path / 'test_predictions.csv'
+    results_df.to_csv(predictions_path, index=False)
+    print(f"Predictions saved to: {predictions_path}")
+
+    # Save coefficients
+    try:
+        coefficients = model.get_coefficients()
+        coef_df = pd.DataFrame({
+            'feature_index': range(len(coefficients['coefficients'])),
+            'coefficient': coefficients['coefficients'],
+            'abs_coefficient': np.abs(coefficients['coefficients'])
+        }).sort_values('abs_coefficient', ascending=False)
+
+        coef_path = run_path / 'coefficients.csv'
+        coef_df.to_csv(coef_path, index=False)
+        print(f"Coefficients saved to: {coef_path}")
+
+        # Plot top coefficients
+        plt.figure(figsize=(10, 6))
+        coef_df_top = coef_df.head(20)
+        colors = ['red' if c < 0 else 'blue' for c in coef_df_top['coefficient']]
+        plt.barh(range(len(coef_df_top)), coef_df_top['coefficient'], color=colors)
+        plt.yticks(range(len(coef_df_top)), [f'f{i}' for i in coef_df_top['feature_index']])
+        plt.xlabel('Coefficient Value')
+        plt.title('Top 20 Linear Regression Coefficients')
+        plt.axvline(x=0, color='black', linestyle='--', linewidth=0.5)
+        plt.tight_layout()
+        plt.savefig(run_path / 'coefficients.png', dpi=300, bbox_inches='tight')
+        plt.close()
+    except Exception as e:
+        print(f"Could not save coefficients: {e}")
+
+    # Save training configuration
+    config_path = run_path / 'config.json'
+    metrics_serializable = {k: float(v) for k, v in metrics.items()}
+
+    config = {
+        'model_type': 'linear',
+        'regularization': regularization,
+        'alpha': float(alpha) if regularization != 'none' else None,
+        'input_dim': int(X_train.shape[1]),
+        'train_samples': int(len(X_train_full)),
+        'test_samples': int(len(X_test)),
+        'final_metrics': metrics_serializable
+    }
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"Configuration saved to: {config_path}")
+
+    return model, metrics, test_preds, y_test
+
+
 def train_xgboost_model(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -920,8 +1060,8 @@ def main():
         '--model_type',
         type=str,
         default='auto',
-        choices=['auto', 'ziln', 'simple', 'xgboost'],
-        help='Model type (auto, ziln, simple, or xgboost). Auto chooses based on loss.'
+        choices=['auto', 'ziln', 'simple', 'xgboost', 'linear'],
+        help='Model type (auto, ziln, simple, xgboost, or linear). Auto chooses based on loss.'
     )
     parser.add_argument(
         '--hidden_dims',
@@ -1029,6 +1169,21 @@ def main():
         help='XGBoost L2 regularization (default: 1.0)'
     )
 
+    # Linear Regression-specific arguments
+    parser.add_argument(
+        '--linear_regularization',
+        type=str,
+        default='none',
+        choices=['none', 'ridge', 'lasso'],
+        help='Linear regression regularization type (default: none)'
+    )
+    parser.add_argument(
+        '--linear_alpha',
+        type=float,
+        default=1.0,
+        help='Linear regression regularization strength (default: 1.0)'
+    )
+
     args = parser.parse_args()
 
     # Create TensorBoard log directory (this will be our main experiment directory)
@@ -1093,6 +1248,44 @@ def main():
         model_type = 'ziln' if args.loss_name in ['ziln', 'mse'] else 'simple'
     else:
         model_type = args.model_type
+
+    # Handle Linear Regression training separately
+    if model_type == 'linear':
+        # Split train into train and validation
+        n_val = int(len(X_train) * 0.2)
+        indices = np.random.permutation(len(X_train))
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        X_train_split = X_train[train_indices]
+        y_train_split = y_train[train_indices]
+        X_val = X_train[val_indices]
+        y_val = y_train[val_indices]
+
+        # Train Linear Regression model
+        model, metrics, preds, true = train_linear_model(
+            X_train=X_train_split,
+            y_train=y_train_split,
+            X_val=X_val,
+            y_val=y_val,
+            X_test=X_test,
+            y_test=y_test,
+            args=args,
+            run_path=run_path
+        )
+
+        print("\n" + "=" * 60)
+        print("Training Complete!")
+        print("=" * 60)
+        print(f"\nExperiment saved to: {run_path}")
+        print(f"\nContents:")
+        print(f"  - Model checkpoint: model_best.pkl")
+        print(f"  - Predictions: test_predictions.csv")
+        print(f"  - Coefficients: coefficients.csv, coefficients.png")
+        print(f"  - Configuration: config.json")
+        print("=" * 60)
+
+        return
 
     # Handle XGBoost training separately (doesn't use PyTorch dataloaders)
     if model_type == 'xgboost':
